@@ -15,7 +15,7 @@ class AdaptiveSSDPModule(nn.Module):
     """
     def __init__(self, input_dim, output_dim, device,
                  warmup_epochs: int = 100,
-                 A_plus: float = 5e-5,
+                 A_plus: float = 1.5e-4,
                  A_baseline: float = 5e-5,
                  sigma: float = 1.0):
         super().__init__()
