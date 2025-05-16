@@ -427,9 +427,14 @@ def train_one_epoch(
     scaler: GradScaler = None,
     one_hot: bool = False,
 ):
+    import time
     import torch
-    model.train()
+    import torch.nn.functional as F
+    from collections import defaultdict
+    from spikingjelly.activation_based import functional
+    from your_module import DSSAWithSSDP   # 请替换为你的实际导入路径
 
+    model.train()
     device  = next(model.parameters()).device
     net     = model.module if hasattr(model, 'module') else model
     num_cls = net.classifier.out_features
@@ -439,7 +444,7 @@ def train_one_epoch(
     counts  = torch.zeros(num_cls, device=device)
     correct = torch.zeros(num_cls, device=device)
 
-    # 用来累积本 epoch 所有 batch 的 cosine similarity
+    # 本 epoch 内所有 batch 的 cosine 相似度容器
     all_cos_da   = []
     all_cos_ssdp = []
 
@@ -459,8 +464,7 @@ def train_one_epoch(
     metrics = Record(['loss', 'acc@1', 'acc@5'])
 
     def accuracy(out, tgt, topk=(1,5)):
-        maxk = max(topk)
-        B    = tgt.size(0)
+        maxk = max(topk); B = tgt.size(0)
         _, pred = out.topk(maxk, 1, True, True)
         pred = pred.t()
         corr = pred.eq(tgt.view(1, -1).expand_as(pred))
@@ -480,7 +484,6 @@ def train_one_epoch(
         else:
             targets_idx  = targets_raw
             targets_soft = F.one_hot(targets_raw, num_cls).float() if one_hot else None
-
         target_tensor = targets_soft if targets_soft is not None else targets_idx
 
         # —— forward & loss ——
@@ -495,17 +498,38 @@ def train_one_epoch(
         # —— backward ——
         if scaler:
             scaler.scale(loss).backward()
-            # 恢复 unscaled grad
             scaler.unscale_(optimizer)
         else:
             loss.backward()
 
-        # —— 监督梯度备份 ——
+        # —— 备份监督梯度 ——
         grad_backup = {
             name: p.grad.detach().clone().flatten()
             for name, p in model.named_parameters()
             if p.requires_grad and p.grad is not None
         }
+
+        # —— 计算 raw SSDP baseline ——
+        pre  = (net.out > 0).float()
+        post = (outputs > 0).float()
+        dt   = (net.t_post.unsqueeze(2) - net.t_pre.unsqueeze(1)).abs()
+        pd_tensor, _ = net.ssdp.compute_pot_dep(pre, post, dt)  # [B, Cout, Cin]
+        raw_ssdp     = pd_tensor.mean(dim=0).clamp(-1.0, 1.0)
+
+        # —— 计算 DA-SSDP 更新 ——
+        delta_w_da = net.ssdp(pre, post, dt, loss=loss, epoch=net.current_epoch)
+
+        # —— 度量余弦相似度 ——
+        measure_name = 'classifier.weight'
+        if measure_name in grad_backup:
+            g  = grad_backup[measure_name]
+            da = delta_w_da.detach().flatten()
+            ss = raw_ssdp.detach().flatten()
+            if da.norm() > 0 and g.norm() > 0:
+                cos_da  = torch.dot(da, g) / (da.norm()  * g.norm() + 1e-8)
+                cos_ss  = torch.dot(ss, g) / (ss.norm()  * g.norm() + 1e-8)
+                all_cos_da.append(cos_da.item())
+                all_cos_ssdp.append(cos_ss.item())
 
         # —— 优化器更新 ——
         if scaler:
@@ -517,57 +541,32 @@ def train_one_epoch(
         if scheduler_per_iter:
             scheduler_per_iter.step()
 
-        # —— 如果模型未写回必需属性，重置并跳过 ——
-        if not (hasattr(net, 'out') and hasattr(net, 't_pre') and hasattr(net, 't_post')):
-            functional.reset_net(model)
-            continue
-
-        # ========================
-        #    SSDP 更新（DA-SSDP）
-        # ========================
-        pre      = (net.out > 0).float()
-        post     = (outputs > 0).float()
-        dt       = (net.t_post.unsqueeze(2) - net.t_pre.unsqueeze(1)).abs()
-        delta_w  = net.ssdp(pre, post, dt, loss=loss, epoch=net.current_epoch)
+        # —— 应用 DA-SSDP 权重更新 ——
         if not warm_phase:
             with torch.no_grad():
-                net.classifier.weight.add_(delta_w.detach())
+                net.classifier.weight.add_(delta_w_da.detach())
 
-        # —— 最后一层 DSSAWithSSDP 的 Wproj 更新 ——
+        # —— DSSAWithSSDP 的 Wproj 更新 ——
         last_stage = net.layers[-1]
         dssa = next((m for m in last_stage if isinstance(m, DSSAWithSSDP)), None)
         if dssa is not None:
-            x_in , x_out = dssa.x_in.detach(), dssa.x_out.detach()   # [T,B,C,H,W]
+            x_in, x_out = dssa.x_in.detach(), dssa.x_out.detach()
             T,B,C,_,_   = x_in.shape
-
-            # 计算第一脉冲时间
             pre_seq  = (x_in.reshape(T,B,C,-1) > 0).any(-1).float()
             post_seq = (x_out.reshape(T,B,C,-1) > 0).any(-1).float()
             pre_first  = pre_seq .cumsum(0).argmax(0).float()
             post_first = post_seq.cumsum(0).argmax(0).float()
             dt2 = (post_first.unsqueeze(2) - pre_first.unsqueeze(1)).abs()
-
             pre2  = (pre_seq.sum(0) > 0).float()
             post2 = (post_seq.sum(0) > 0).float()
-            dw2 = net.ssdp_dssa(pre2, post2, dt2, loss=loss, epoch=net.current_epoch)
+            dw2 = net.ssdp_dssa(pre2, post2, dt2,
+                                loss=loss, epoch=net.current_epoch)
             if not warm_phase:
                 with torch.no_grad():
                     dssa.Wproj.weight.add_(dw2.detach().view(C, C, 1, 1))
 
         # —— 重置神经元状态 ——
         functional.reset_net(model)
-
-        # —— 余弦相似度计算（以 classifier.weight 为例） ——
-        da = delta_w.detach().flatten()
-        ss = delta_w.detach().flatten()  # baseline SSDP
-        g_name = 'classifier.weight'
-        if g_name in grad_backup:
-            g = grad_backup[g_name]
-            if da.norm() > 0 and g.norm() > 0:
-                cos_da = torch.dot(da, g) / (da.norm() * g.norm() + 1e-8)
-                cos_ss = torch.dot(ss, g) / (ss.norm() * g.norm() + 1e-8)
-                all_cos_da.append(cos_da.item())
-                all_cos_ssdp.append(cos_ss.item())
 
         # —— 记录 loss & acc ——
         metrics.update('loss', loss.item(), images.size(0))
@@ -587,8 +586,8 @@ def train_one_epoch(
             ).float()
 
         # —— 日志输出 ——
-        if print_freq and (idx+1) % max(1, len(data_loader_train)//print_freq) == 0:
-            speed = (idx+1) * images.size(0) * factor / (time.time() - t0)
+        if print_freq and (idx + 1) % max(1, len(data_loader_train)//print_freq) == 0:
+            speed = (idx + 1)*images.size(0)*factor / (time.time() - t0)
             logger.debug(
                 f'[{idx+1}/{len(data_loader_train)}] '
                 f'it/s:{speed:.2f}  '
@@ -604,7 +603,7 @@ def train_one_epoch(
 
     print(
         f"[Epoch {net.current_epoch:>2d}]  "
-        f"DA-SSDP vs grad: {mean_da:.4f},  SSDP vs grad: {mean_ssdp:.4f}"
+        f"DA-SSDP vs grad: {mean_da:.6f},  SSDP vs grad: {mean_ssdp:.6f}"
     )
 
     per_class_acc = (
@@ -747,11 +746,15 @@ def main():
     safe_makedirs(args.output_dir)
     logger = setup_logger(args.output_dir)
 
-    distributed, rank, world_size, local_rank = init_distributed(logger, args.distributed_init_mode)
+    distributed, rank, world_size, local_rank = init_distributed(
+        logger, args.distributed_init_mode
+    )
 
     logger.info(str(args))
 
-    # load data
+    ##################################################
+    #                   load data
+    ##################################################
 
     dataset_type = args.dataset
     one_hot = None
@@ -781,11 +784,26 @@ def main():
         input_size = args.input_size
 
     dataset_train, dataset_test, data_loader_train, data_loader_test = load_data(
-        args.data_path, args.batch_size, args.workers, num_classes, dataset_type, input_size,
-        distributed, args.augment, args.mixup, args.cutout, args.label_smoothing, args.T)
-    logger.info('dataset_train: {}, dataset_test: {}'.format(len(dataset_train), len(dataset_test)))
+        args.data_path,
+        args.batch_size,
+        args.workers,
+        num_classes,
+        dataset_type,
+        input_size,
+        distributed,
+        args.augment,
+        args.mixup,
+        args.cutout,
+        args.label_smoothing,
+        args.T
+    )
+    logger.info(
+        f'dataset_train: {len(dataset_train)}, dataset_test: {len(dataset_test)}'
+    )
 
-    # model
+    ##################################################
+    #                     model
+    ##################################################
 
     model = create_model(
         args.model,
@@ -794,12 +812,13 @@ def main():
         img_size=input_size[-1],
     ).cuda()
 
-    # transfer
     if args.transfer:
-        checkpoint = torch.load(args.transfer, map_location='cpu')
-        model.transfer(checkpoint['model'])
+        ckpt = torch.load(args.transfer, map_location='cpu')
+        model.transfer(ckpt['model'])
 
-    # optimzer
+    ##################################################
+    #                   optimizer
+    ##################################################
 
     optimizer = create_optimizer_v2(
         model,
@@ -808,24 +827,31 @@ def main():
         weight_decay=args.weight_decay,
     )
 
-    # loss_fn
+    ##################################################
+    #                  loss functions
+    ##################################################
 
     if args.mixup:
         criterion = SoftTargetCrossEntropy()
     else:
         criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
     criterion = CriterionWarpper(criterion, args.TET, args.TET_phi, args.TET_lambda)
+
     criterion_eval = nn.CrossEntropyLoss()
     criterion_eval = CriterionWarpper(criterion_eval)
 
-    # amp speed up
+    ##################################################
+    #                     amp
+    ##################################################
 
     if args.amp:
         scaler = GradScaler()
     else:
         scaler = None
 
-    # lr scheduler
+    ##################################################
+    #               lr scheduler
+    ##################################################
 
     lr_scheduler, _ = create_scheduler_v2(
         optimizer,
@@ -837,34 +863,44 @@ def main():
         warmup_epochs=3,
     )
 
-    # Sync BN
+    ##################################################
+    #                   Sync BN
+    ##################################################
+
     if args.sync_bn:
         model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
-    # DDP
+    ##################################################
+    #                     DDP
+    ##################################################
 
     model_without_ddp = model
     if distributed and not args.test_only:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank],
-                                                          find_unused_parameters=True)
+        model = nn.parallel.DistributedDataParallel(
+            model, device_ids=[local_rank], find_unused_parameters=True
+        )
         model_without_ddp = model.module
 
-    # custom scheduler
+    ##################################################
+    #               custom schedulers
+    ##################################################
 
     scheduler_per_iter = None
     scheduler_per_epoch = None
 
-    # resume
+    ##################################################
+    #                     resume
+    ##################################################
 
     if args.resume:
-        checkpoint = torch.load(args.resume, map_location='cpu')
-        model_without_ddp.load_state_dict(checkpoint['model'])
-        optimizer.load_state_dict(checkpoint['optimizer'])
-        start_epoch = checkpoint['epoch']
-        max_acc1 = checkpoint['max_acc1']
+        ckpt = torch.load(args.resume, map_location='cpu')
+        model_without_ddp.load_state_dict(ckpt['model'])
+        optimizer.load_state_dict(ckpt['optimizer'])
+        start_epoch = ckpt['epoch']
+        max_acc1 = ckpt['max_acc1']
         if lr_scheduler is not None:
-            lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
-        logger.info('Resume from epoch {}'.format(start_epoch))
+            lr_scheduler.load_state_dict(ckpt['lr_scheduler'])
+        logger.info(f'Resume from epoch {start_epoch}')
         start_epoch += 1
     else:
         start_epoch = 0
@@ -880,49 +916,81 @@ def main():
         if distributed:
             logger.error('Using distribute mode in test, abort')
             return
-        test(model_without_ddp, data_loader_test, input_size, args, logger)
+        test(
+            model_without_ddp,
+            data_loader_test,
+            input_size,
+            args,
+            logger
+        )
         return
 
     ##################################################
-    #                   Train
+    #                     Train
     ##################################################
 
     tb_writer = None
     if is_main_process():
-        tb_writer = SummaryWriter(os.path.join(args.output_dir, 'tensorboard'),
-                                  purge_step=start_epoch)
+        tb_writer = SummaryWriter(
+            os.path.join(args.output_dir, 'tensorboard'),
+            purge_step=start_epoch
+        )
 
     logger.info("[Train]")
     for epoch in range(start_epoch, args.epochs):
         if distributed and hasattr(data_loader_train.sampler, 'set_epoch'):
             data_loader_train.sampler.set_epoch(epoch)
-        logger.info('Epoch [{}] Start, lr {:.6f}'.format(epoch, optimizer.param_groups[0]["lr"]))
+        logger.info(
+            f'Epoch [{epoch}] Start, lr {optimizer.param_groups[0]["lr"]:.6f}'
+        )
 
-        # 如果模型内有 self.current_epoch 需更新：
         if hasattr(model_without_ddp, 'current_epoch'):
             model_without_ddp.current_epoch = epoch
 
         with Timer(' Train', logger):
-            train_loss, train_acc1, train_acc5, per_class_acc = train_one_epoch(model, criterion, optimizer,
-                                                                 data_loader_train, logger,
-                                                                 args.print_freq, world_size,
-                                                                 scheduler_per_iter, scaler,
-                                                                 one_hot)
+            train_loss, train_acc1, train_acc5, per_class_acc = train_one_epoch(
+                model,
+                criterion,
+                optimizer,
+                data_loader_train,
+                logger,
+                args.print_freq,
+                world_size,
+                scheduler_per_iter,
+                scaler,
+                one_hot
+            )
             if lr_scheduler is not None:
                 lr_scheduler.step(epoch + 1)
             if scheduler_per_epoch is not None:
                 scheduler_per_epoch.step()
 
         with Timer(' Test', logger):
-            test_loss, test_acc1, test_acc5 = evaluate(model, criterion_eval, data_loader_test,
-                                                       args.print_freq, logger, one_hot)
+            test_loss, test_acc1, test_acc5 = evaluate(
+                model,
+                criterion_eval,
+                data_loader_test,
+                args.print_freq,
+                logger,
+                one_hot
+            )
 
         if is_main_process() and tb_writer is not None:
-            tb_record(tb_writer, train_loss, train_acc1, train_acc5, test_loss, test_acc1,
-                      test_acc5, epoch)
+            tb_record(
+                tb_writer,
+                train_loss,
+                train_acc1,
+                train_acc5,
+                test_loss,
+                test_acc1,
+                test_acc5,
+                epoch
+            )
 
-        logger.info(' Test loss: {:.5f}, Acc@1: {:.5f}, Acc@5: {:.5f}'.format(
-            test_loss, test_acc1, test_acc5))
+        logger.info(
+            f' Test loss: {test_loss:.5f}, '
+            f'Acc@1: {test_acc1:.5f}, Acc@5: {test_acc5:.5f}'
+        )
 
         checkpoint = {
             'model': model_without_ddp.state_dict(),
@@ -934,32 +1002,49 @@ def main():
             checkpoint['lr_scheduler'] = lr_scheduler.state_dict()
 
         if args.save_latest:
-            save_on_master(checkpoint, os.path.join(args.output_dir, 'checkpoint_latest.pth'))
+            save_on_master(
+                checkpoint,
+                os.path.join(args.output_dir, 'checkpoint_latest.pth')
+            )
 
         if max_acc1 < test_acc1:
             max_acc1 = test_acc1
-            save_on_master(checkpoint, os.path.join(args.output_dir, 'checkpoint_max_acc1.pth'))
+            save_on_master(
+                checkpoint,
+                os.path.join(args.output_dir, 'checkpoint_max_acc1.pth')
+            )
 
     logger.info('Training completed.')
 
-    # —— 绘制并保存 DA-SSDP 对齐曲线 ——
+    ##################################################
+    #           plot & save alignment
+    ##################################################
+
     plt.figure(figsize=(6, 4))
     plt.plot(epoch_cosines_da_ssdp, label='DA-SSDP vs grad')
     plt.plot(epoch_cosines_ssdp,      label='SSDP vs grad')
-    plt.hlines(1.0, 0, len(epoch_cosines_da_ssdp) - 1,
-               linestyles='--', label='grad vs itself')
+    plt.hlines(
+        1.0,
+        0,
+        len(epoch_cosines_da_ssdp) - 1,
+        linestyles='--',
+        label='grad vs itself'
+    )
     plt.xlabel('Epoch')
     plt.ylabel('Average cosine similarity')
     plt.legend()
     plt.tight_layout()
-    plt.savefig(os.path.join(args.output_dir, 'gradient_alignment.pdf'), format='pdf', dpi=600)
+    plt.savefig(
+        os.path.join(args.output_dir, 'gradient_alignment.pdf'),
+        format='pdf',
+        dpi=600
+    )
     logger.info("Saved high-res alignment plot to gradient_alignment.pdf")
 
     ##################################################
-    #                   test
+    #                   Final Test
     ##################################################
 
-    # reset model
     del model, model_without_ddp
 
     model = create_model(
@@ -970,27 +1055,44 @@ def main():
     )
 
     try:
-        checkpoint = torch.load(os.path.join(args.output_dir, 'checkpoint_max_acc1.pth'),
-                                map_location='cpu')
-        model.load_state_dict(checkpoint['model'])
+        ckpt = torch.load(
+            os.path.join(args.output_dir, 'checkpoint_max_acc1.pth'),
+            map_location='cpu'
+        )
+        model.load_state_dict(ckpt['model'])
     except:
         logger.warning('Cannot load max acc1 model, skip test.')
         logger.warning('Exit.')
         return
 
-    # reload data
+    # reload only test data
     del dataset_train, dataset_test, data_loader_train, data_loader_test
-    _, _, _, data_loader_test = load_data(args.data_path, args.batch_size, args.workers,
-                                          num_classes, dataset_type, input_size, False,
-                                          args.augment, args.mixup, args.cutout,
-                                          args.label_smoothing, args.T)
+    _, _, _, data_loader_test = load_data(
+        args.data_path,
+        args.batch_size,
+        args.workers,
+        num_classes,
+        dataset_type,
+        input_size,
+        False,
+        args.augment,
+        args.mixup,
+        args.cutout,
+        args.label_smoothing,
+        args.T
+    )
 
-    # final test
     model = model.cuda()
     if is_main_process():
-        test(model, data_loader_test, input_size, args, logger)
+        test(
+            model,
+            data_loader_test,
+            input_size,
+            args,
+            logger
+        )
     logger.info('All Done.')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
