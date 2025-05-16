@@ -427,12 +427,6 @@ def train_one_epoch(
     scaler: GradScaler = None,
     one_hot: bool = False,
 ):
-    import time
-    import torch
-    import torch.nn.functional as F
-    from collections import defaultdict
-    from spikingjelly.activation_based import functional
-    from your_module import DSSAWithSSDP   # 请替换为你的实际导入路径
 
     model.train()
     device  = next(model.parameters()).device
