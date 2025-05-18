@@ -426,8 +426,8 @@ def train_one_epoch(
     scheduler_per_iter=None,
     scaler: GradScaler = None,
     one_hot: bool = False,
+    align_lambda: float = 0.1,   # <—— 对齐度正则化权重
 ):
-
     model.train()
     device  = next(model.parameters()).device
     net     = model.module if hasattr(model, 'module') else model
@@ -480,7 +480,7 @@ def train_one_epoch(
             targets_soft = F.one_hot(targets_raw, num_cls).float() if one_hot else None
         target_tensor = targets_soft if targets_soft is not None else targets_idx
 
-        # —— forward & loss ——
+        # —— forward & 损失 ——
         if scaler:
             with torch.cuda.amp.autocast():
                 outputs = model(images)
@@ -489,14 +489,14 @@ def train_one_epoch(
             outputs = model(images)
             loss    = criterion(outputs, target_tensor)
 
-        # —— backward ——
+        # —— 反向传播监督损失，拿到梯度 ——
         if scaler:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
         else:
             loss.backward()
 
-        # —— 备份监督梯度 ——
+        # —— 备份当前所有可训练参数的梯度 ——
         grad_backup = {
             name: p.grad.detach().clone().flatten()
             for name, p in model.named_parameters()
@@ -507,25 +507,33 @@ def train_one_epoch(
         pre  = (net.out > 0).float()
         post = (outputs > 0).float()
         dt   = (net.t_post.unsqueeze(2) - net.t_pre.unsqueeze(1)).abs()
-        pd_tensor, _ = net.ssdp.compute_pot_dep(pre, post, dt)  # [B, Cout, Cin]
+        pd_tensor, _ = net.ssdp.compute_pot_dep(pre, post, dt)  # [B,Cout,Cin]
         raw_ssdp     = pd_tensor.mean(dim=0).clamp(-1.0, 1.0)
 
-        # —— 计算 DA-SSDP 更新 ——
-        delta_w_da = net.ssdp(pre, post, dt, loss=loss, epoch=net.current_epoch)
+        # —— 计算 DA-SSDP 更新 ΔWᴰᴬ ——
+        delta_w_da = net.ssdp(pre, post, dt,
+                              loss=loss, epoch=net.current_epoch)  # 依赖 A_plus/A_baseline
 
-        # —— 度量余弦相似度 ——
+        # —— 对齐度正则化 ——
+        # 取 classifier.weight 分量来度量
         measure_name = 'classifier.weight'
         if measure_name in grad_backup:
-            g  = grad_backup[measure_name]
-            da = delta_w_da.detach().flatten()
-            ss = raw_ssdp.detach().flatten()
-            if da.norm() > 0 and g.norm() > 0:
-                cos_da  = torch.dot(da, g) / (da.norm()  * g.norm() + 1e-8)
-                cos_ss  = torch.dot(ss, g) / (ss.norm()  * g.norm() + 1e-8)
-                all_cos_da.append(cos_da.item())
-                all_cos_ssdp.append(cos_ss.item())
+            g  = grad_backup[measure_name]               # [Cout*Cin]
+            da = delta_w_da.flatten()                    # [Cout*Cin]
+            # 计算余弦（这里不用 detach，保持图连通以更新 A_plus/A_baseline）
+            cos_da = torch.dot(da, g) / (da.norm()*g.norm() + 1e-8)
+            align_loss = align_lambda * (1.0 - cos_da)
+            # 反向传播对齐正则，只会影响到 AdaptiveSSDPModule 中的 A_plus/A_baseline
+            if scaler:
+                scaler.scale(align_loss).backward()
+            else:
+                align_loss.backward()
+            # 同时也记录这两条曲线
+            cos_ss = torch.dot(raw_ssdp.flatten(), g) / (raw_ssdp.norm()*g.norm() + 1e-8)
+            all_cos_da.append(cos_da.item())
+            all_cos_ssdp.append(cos_ss.item())
 
-        # —— 优化器更新 ——
+        # —— 优化器更新（包括 A_plus/A_baseline）——
         if scaler:
             scaler.step(optimizer)
             scaler.update()
@@ -535,12 +543,12 @@ def train_one_epoch(
         if scheduler_per_iter:
             scheduler_per_iter.step()
 
-        # —— 应用 DA-SSDP 权重更新 ——
+        # —— 应用 DA-SSDP 权重更新到分类层 ——
         if not warm_phase:
             with torch.no_grad():
                 net.classifier.weight.add_(delta_w_da.detach())
 
-        # —— DSSAWithSSDP 的 Wproj 更新 ——
+        # —— 最后一层 DSSAWithSSDP 的 Wproj 更新 ——
         last_stage = net.layers[-1]
         dssa = next((m for m in last_stage if isinstance(m, DSSAWithSSDP)), None)
         if dssa is not None:
@@ -605,7 +613,6 @@ def train_one_epoch(
     ) if not warm_phase else torch.zeros(num_cls, device=device)
 
     return metrics['loss'], metrics['acc@1'], metrics['acc@5'], per_class_acc
-
 
 
 
