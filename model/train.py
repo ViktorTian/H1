@@ -426,8 +426,9 @@ def train_one_epoch(
     scheduler_per_iter=None,
     scaler: GradScaler = None,
     one_hot: bool = False,
-    align_lambda: float = 0.1,   # <—— 对齐度正则化权重
+    align_lambda: float = 0.1,
 ):
+
     model.train()
     device  = next(model.parameters()).device
     net     = model.module if hasattr(model, 'module') else model
@@ -480,7 +481,7 @@ def train_one_epoch(
             targets_soft = F.one_hot(targets_raw, num_cls).float() if one_hot else None
         target_tensor = targets_soft if targets_soft is not None else targets_idx
 
-        # —— forward & 损失 ——
+        # —— forward & loss ——
         if scaler:
             with torch.cuda.amp.autocast():
                 outputs = model(images)
@@ -489,14 +490,14 @@ def train_one_epoch(
             outputs = model(images)
             loss    = criterion(outputs, target_tensor)
 
-        # —— 反向传播监督损失，拿到梯度 ——
+        # —— backward 监督损失 ——
         if scaler:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
         else:
             loss.backward()
 
-        # —— 备份当前所有可训练参数的梯度 ——
+        # —— 备份监督梯度 ——
         grad_backup = {
             name: p.grad.detach().clone().flatten()
             for name, p in model.named_parameters()
@@ -511,27 +512,26 @@ def train_one_epoch(
         raw_ssdp     = pd_tensor.mean(dim=0).clamp(-1.0, 1.0)
 
         # —— 计算 DA-SSDP 更新 ΔWᴰᴬ ——
-        delta_w_da = net.ssdp(pre, post, dt,
-                              loss=loss, epoch=net.current_epoch)  # 依赖 A_plus/A_baseline
+        delta_w_da = net.ssdp(pre, post, dt, loss=loss, epoch=net.current_epoch)
 
-        # —— 对齐度正则化 ——
-        # 取 classifier.weight 分量来度量
-        measure_name = 'classifier.weight'
-        if measure_name in grad_backup:
-            g  = grad_backup[measure_name]               # [Cout*Cin]
-            da = delta_w_da.flatten()                    # [Cout*Cin]
-            # 计算余弦（这里不用 detach，保持图连通以更新 A_plus/A_baseline）
-            cos_da = torch.dot(da, g) / (da.norm()*g.norm() + 1e-8)
-            align_loss = align_lambda * (1.0 - cos_da)
-            # 反向传播对齐正则，只会影响到 AdaptiveSSDPModule 中的 A_plus/A_baseline
-            if scaler:
-                scaler.scale(align_loss).backward()
-            else:
-                align_loss.backward()
-            # 同时也记录这两条曲线
-            cos_ss = torch.dot(raw_ssdp.flatten(), g) / (raw_ssdp.norm()*g.norm() + 1e-8)
-            all_cos_da.append(cos_da.item())
-            all_cos_ssdp.append(cos_ss.item())
+        # —— 对齐度正则化（仅在 ssdp_phase，即 warm_phase=False 时） ——
+        if not warm_phase:
+            measure_name = 'classifier.weight'
+            if measure_name in grad_backup:
+                g  = grad_backup[measure_name]              # [C_out*C_in]
+                da = delta_w_da.flatten()                   # [C_out*C_in]
+                # 计算 ΔWᴰᴬ 与 ∇W 的余弦
+                cos_da = torch.dot(da, g) / (da.norm()*g.norm() + 1e-8)
+                # 构造并反向传播对齐正则
+                align_loss = align_lambda * (1.0 - cos_da)
+                if scaler:
+                    scaler.scale(align_loss).backward()
+                else:
+                    align_loss.backward()
+                # 记录 baseline 和 DA 曲线
+                cos_ss = torch.dot(raw_ssdp.flatten(), g) / (raw_ssdp.norm()*g.norm() + 1e-8)
+                all_cos_da.append(cos_da.item())
+                all_cos_ssdp.append(cos_ss.item())
 
         # —— 优化器更新（包括 A_plus/A_baseline）——
         if scaler:
@@ -561,8 +561,7 @@ def train_one_epoch(
             dt2 = (post_first.unsqueeze(2) - pre_first.unsqueeze(1)).abs()
             pre2  = (pre_seq.sum(0) > 0).float()
             post2 = (post_seq.sum(0) > 0).float()
-            dw2 = net.ssdp_dssa(pre2, post2, dt2,
-                                loss=loss, epoch=net.current_epoch)
+            dw2 = net.ssdp_dssa(pre2, post2, dt2, loss=loss, epoch=net.current_epoch)
             if not warm_phase:
                 with torch.no_grad():
                     dssa.Wproj.weight.add_(dw2.detach().view(C, C, 1, 1))
@@ -576,7 +575,7 @@ def train_one_epoch(
         metrics.update('acc@1', acc1.item(), images.size(0))
         metrics.update('acc@5', acc5.item(), images.size(0))
 
-        # —— per-class 准确率统计 ——
+        # —— per-class 统计 ——
         if not warm_phase:
             t_flat = targets_idx.view(-1)
             p_flat = outputs.argmax(1).view(-1)
