@@ -208,46 +208,50 @@ class DSSA(nn.Module):
 
 class DSSAWithSSDP(DSSA):
     """
-    用于在 forward() 中记录 x_in, x_out，以便训练时做 SSDP。
-    这里只演示把 SSDP 应用到 self.Wproj 的权重上(形状[C, C, 1, 1])，相对容易映射到 [C_out, C_in]。
+    用于在 forward() 中记录 x_in, x_out 以及每个 time-step 的 attention maps，
+    以便训练时做 SSDP 以及后续可视化分析。
     """
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 记录输入
-        self.x_in = x.detach().clone()
-        T,B,C,H,W = x.shape
+        # 记录输入脉冲序列
+        self.x_in = x.detach().clone()  # [T, B, C, H, W]
+        T, B, C, H, W = x.shape
 
-        # 我们要重新写一遍父类前半段以拿到 attn
-        # 1. 激活与线性变换
+        # 1. 激活并做线性变换
         x_feat = x.clone()
-        x = self.activation_in(x)                              # [T,B,C,H,W]
-        y = self.W(x)                                          # [T,B,2C,H',W']
-        y = self.norm(y)
-        # 2. 重塑为 heads 结构
-        y = y.reshape(T, B, self.num_heads, 2*(C//self.num_heads), -1)
-        y1, y2 = y[:,:,:,:,:C//self.num_heads], y[:,:,:,:,C//self.num_heads:]
-        x_flat = x.reshape(T, B, self.num_heads, C//self.num_heads, -1)
+        x_act  = self.activation_in(x_feat)                    # [T, B, C, H, W]
+        y      = self.W(x_act)                                 # [T, B, 2C, H', W']
+        y      = self.norm(y)
 
-        # 3. 计算第一路 attention
-        # 在训练/推理统一使用同样逻辑来记录
+        # 2. 重塑为多头结构并拆分通道
+        #    新 spatial 大小 H', W'，flatten 得到 N tokens
+        _, _, _, H2, W2 = y.shape
+        N      = H2 * W2
+        dim    = C // self.num_heads
+        # y: [T, B, heads, 2*dim, N]
+        y      = y.reshape(T, B, self.num_heads, 2 * dim, N)
+        # 沿着通道维度拆分为 y1, y2
+        y1, y2 = y.split(dim, dim=3)                           # each [T, B, heads, dim, N]
+
+        # 3. 重塑 x 以匹配 matmul1 输入
+        x_flat = x_act.reshape(T, B, self.num_heads, dim, -1)  # [T, B, heads, dim, N]
+
+        # 4. 逐时间步计算并记录 attention maps
         attn_list = []
         for t in range(T):
-            # 注意要 detach 后面再聚合
-            scale1 = 1./torch.sqrt(self.firing_rate_x * (self.dim//self.num_heads))
-            attn = self.matmul1(y1[t].transpose(-1,-2), x_flat[t])  # [B, heads, N, N]
-            attn = attn * scale1
-            attn = self.activation_attn(attn)
+            lhs  = y1[t].transpose(-1, -2)   # [B, heads, N, dim]
+            rhs  = x_flat[t]                 # [B, heads, dim, N]
+            attn = self.matmul1(lhs, rhs)    # [B, heads, N, N]
             attn_list.append(attn.detach().cpu())
-
-        # 保存所有 T 帧 attention
-        # 最终形状: [T, B, heads, N, N]
+        # 将所有 time-step 堆叠：[T, B, heads, N, N]
         self.attn_maps = torch.stack(attn_list, dim=0)
 
-        # 4. 再执行剩余的父类 forward
+        # 5. 原始 DSSA 前向计算
         out = super().forward(x_feat)
 
-        # 5. 记录 x_out
-        self.x_out = out.detach().clone()
+        # 6. 记录输出脉冲序列
+        self.x_out = out.detach().clone()  # [T, B, C, H, W]
         return out
+
 
 
 class DownsampleLayer(nn.Module):
