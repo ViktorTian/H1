@@ -39,9 +39,7 @@ from models.spikingresformer import DSSAWithSSDP
 from collections import defaultdict
 import matplotlib.pyplot as plt
 
-# 用来存每个 epoch 的平均余弦相似度
-epoch_cosines_da_ssdp = []
-epoch_cosines_ssdp  = []
+
 
 def parse_args():
     config_parser = argparse.ArgumentParser(description="Training Config", add_help=False)
@@ -424,64 +422,60 @@ def train_one_epoch(
     print_freq: int,
     factor: int,
     scheduler_per_iter=None,
-    scaler: GradScaler = None,
-    one_hot: bool = False,
-    align_lambda: float = 0.1,
+    scaler: Optional[GradScaler] = None,
+    one_hot: Optional[int] = None,
 ):
+    import time, torch
+    import torch.nn.functional as F
+    from collections import defaultdict
+    from spikingjelly.activation_based import functional
 
     model.train()
+
     device  = next(model.parameters()).device
     net     = model.module if hasattr(model, 'module') else model
     num_cls = net.classifier.out_features
+    # net.current_epoch = epoch
+    # -------- 判断阶段 --------
     warm_phase = net.current_epoch < net.ssdp.warmup_epochs
 
-    # per-class 统计
+    # -------- 统计 --------
     counts  = torch.zeros(num_cls, device=device)
     correct = torch.zeros(num_cls, device=device)
 
-    # 本 epoch 内所有 batch 的 cosine 相似度容器
-    all_cos_da   = []
-    all_cos_ssdp = []
-
-    # 简单的 metrics 记录器
     class Record:
         def __init__(self, keys):
             self.sum, self.cnt = defaultdict(float), defaultdict(int)
-            for k in keys:
-                self.sum[k] = 0.0
-                self.cnt[k] = 0
-        def update(self, k, v, n=1):
-            self.sum[k] += v * n
-            self.cnt[k] += n
-        def __getitem__(self, k):
-            return self.sum[k] / self.cnt[k] if self.cnt[k] else 0.0
+            for k in keys: self.sum[k]=0.0; self.cnt[k]=0
+        def update(self,k,v,n=1):
+            self.sum[k]+=v*n; self.cnt[k]+=n
+        def __getitem__(self,k):
+            return self.sum[k]/self.cnt[k] if self.cnt[k] else 0.0
+    metrics = Record(['loss','acc@1','acc@5'])
 
-    metrics = Record(['loss', 'acc@1', 'acc@5'])
-
-    def accuracy(out, tgt, topk=(1,5)):
+    def accuracy(out,tgt,topk=(1,5)):
         maxk = max(topk); B = tgt.size(0)
-        _, pred = out.topk(maxk, 1, True, True)
-        pred = pred.t()
-        corr = pred.eq(tgt.view(1, -1).expand_as(pred))
-        return [corr[:k].reshape(-1).float().sum().mul_(100.0 / B) for k in topk]
+        _,pred = out.topk(maxk,1,True,True); pred = pred.t()
+        corr = pred.eq(tgt.view(1,-1).expand_as(pred))
+        return [corr[:k].reshape(-1).float().sum().mul_(100.0/B) for k in topk]
 
-    t0 = time.time()
-    model.zero_grad()
+    t0 = time.time(); model.zero_grad()
 
-    for idx, (images, targets_raw) in enumerate(data_loader_train):
-        images      = images.to(device)
-        targets_raw = targets_raw.to(device)
+    for idx,(images,targets_raw) in enumerate(data_loader_train):
+        images       = images.to(device)
+        targets_raw  = targets_raw.to(device)
 
-        # —— 统一标签格式 ——
-        if targets_raw.ndim > 1:
+        # ---------- 统一标签 ----------
+        if targets_raw.ndim > 1:                     # mixup / cutmix -> soft label
             targets_idx  = targets_raw.argmax(-1)
             targets_soft = targets_raw.float()
-        else:
+        else:                                        # 普通整型标签
             targets_idx  = targets_raw
             targets_soft = F.one_hot(targets_raw, num_cls).float() if one_hot else None
+
         target_tensor = targets_soft if targets_soft is not None else targets_idx
 
-        # —— forward & loss ——
+        # ---------- forward & loss ----------
         if scaler:
             with torch.cuda.amp.autocast():
                 outputs = model(images)
@@ -490,128 +484,81 @@ def train_one_epoch(
             outputs = model(images)
             loss    = criterion(outputs, target_tensor)
 
-        # —— backward 监督损失 ——
+        # ---------- backward ----------
         if scaler:
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
+            scaler.step(optimizer); scaler.update()
         else:
-            loss.backward()
-
-        # —— 备份监督梯度 ——
-        grad_backup = {
-            name: p.grad.detach().clone().flatten()
-            for name, p in model.named_parameters()
-            if p.requires_grad and p.grad is not None
-        }
-
-        # —— 计算 raw SSDP baseline ——
-        pre  = (net.out > 0).float()
-        post = (outputs > 0).float()
-        dt   = (net.t_post.unsqueeze(2) - net.t_pre.unsqueeze(1)).abs()
-        pd_tensor, _ = net.ssdp.compute_pot_dep(pre, post, dt)  # [B,Cout,Cin]
-        raw_ssdp     = pd_tensor.mean(dim=0).clamp(-1.0, 1.0)
-
-        # —— 计算 DA-SSDP 更新 ΔWᴰᴬ ——
-        delta_w_da = net.ssdp(pre, post, dt, loss=loss, epoch=net.current_epoch)
-
-        # —— 对齐度正则化（仅在 ssdp_phase，即 warm_phase=False 时） ——
-        if not warm_phase:
-            measure_name = 'classifier.weight'
-            if measure_name in grad_backup:
-                g  = grad_backup[measure_name]              # [C_out*C_in]
-                da = delta_w_da.flatten()                   # [C_out*C_in]
-                # 计算 ΔWᴰᴬ 与 ∇W 的余弦
-                cos_da = torch.dot(da, g) / (da.norm()*g.norm() + 1e-8)
-                # 构造并反向传播对齐正则
-                align_loss = align_lambda * (1.0 - cos_da)
-                if scaler:
-                    scaler.scale(align_loss).backward()
-                else:
-                    align_loss.backward()
-                # 记录 baseline 和 DA 曲线
-                cos_ss = torch.dot(raw_ssdp.flatten(), g) / (raw_ssdp.norm()*g.norm() + 1e-8)
-                all_cos_da.append(cos_da.item())
-                all_cos_ssdp.append(cos_ss.item())
-
-        # —— 优化器更新（包括 A_plus/A_baseline）——
-        if scaler:
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            optimizer.step()
+            loss.backward(); optimizer.step()
         model.zero_grad()
-        if scheduler_per_iter:
-            scheduler_per_iter.step()
+        if scheduler_per_iter: scheduler_per_iter.step()
 
-        # —— 应用 DA-SSDP 权重更新到分类层 ——
+        # ---------- 若网络未写回必需属性，重置继续 ----------
+        if not (hasattr(net,'out') and hasattr(net,'t_pre') and hasattr(net,'t_post')):
+            functional.reset_net(model); continue
+
+        # ===========================================================
+        #                 SSDP 更新（仅 ssdp_phase 写权重）
+        # ===========================================================
+        pre  = (net.out   > 0).float()
+        post = (outputs   > 0).float()
+        dt   = (net.t_post.unsqueeze(2) - net.t_pre.unsqueeze(1)).abs()
+        delta_w = net.ssdp(pre, post, dt, loss=loss, epoch=net.current_epoch)
         if not warm_phase:
             with torch.no_grad():
-                net.classifier.weight.add_(delta_w_da.detach())
+                net.classifier.weight.add_(delta_w.detach())
 
-        # —— 最后一层 DSSAWithSSDP 的 Wproj 更新 ——
+        # ---- DSSA.Wproj ----
         last_stage = net.layers[-1]
         dssa = next((m for m in last_stage if isinstance(m, DSSAWithSSDP)), None)
         if dssa is not None:
-            x_in, x_out = dssa.x_in.detach(), dssa.x_out.detach()
+            x_in ,x_out = dssa.x_in.detach(), dssa.x_out.detach()   # [T,B,C,H,W]
             T,B,C,_,_   = x_in.shape
-            pre_seq  = (x_in.reshape(T,B,C,-1) > 0).any(-1).float()
+            pre_seq  = (x_in .reshape(T,B,C,-1) > 0).any(-1).float()
             post_seq = (x_out.reshape(T,B,C,-1) > 0).any(-1).float()
+
             pre_first  = pre_seq .cumsum(0).argmax(0).float()
             post_first = post_seq.cumsum(0).argmax(0).float()
-            dt2 = (post_first.unsqueeze(2) - pre_first.unsqueeze(1)).abs()
-            pre2  = (pre_seq.sum(0) > 0).float()
+            dt2  = (post_first.unsqueeze(2) - pre_first.unsqueeze(1)).abs()
+
+            pre2  = (pre_seq .sum(0) > 0).float()
             post2 = (post_seq.sum(0) > 0).float()
+
             dw2 = net.ssdp_dssa(pre2, post2, dt2, loss=loss, epoch=net.current_epoch)
             if not warm_phase:
                 with torch.no_grad():
                     dssa.Wproj.weight.add_(dw2.detach().view(C, C, 1, 1))
 
-        # —— 重置神经元状态 ——
+        # ---------- reset neuron states ----------
         functional.reset_net(model)
 
-        # —— 记录 loss & acc ——
+        # ---------- 记录 ----------
         metrics.update('loss', loss.item(), images.size(0))
         acc1, acc5 = accuracy(outputs, targets_idx)
         metrics.update('acc@1', acc1.item(), images.size(0))
         metrics.update('acc@5', acc5.item(), images.size(0))
 
-        # —— per-class 统计 ——
-        if not warm_phase:
+        if not warm_phase:  # 统计 per-class 只在 ssdp_phase
             t_flat = targets_idx.view(-1)
             p_flat = outputs.argmax(1).view(-1)
             counts  += torch.bincount(t_flat, minlength=num_cls).float()
             correct += torch.bincount(
                 t_flat,
                 weights=(p_flat == t_flat).float(),
-                minlength=num_cls
-            ).float()
+                minlength=num_cls).float()
 
-        # —— 日志输出 ——
-        if print_freq and (idx + 1) % max(1, len(data_loader_train)//print_freq) == 0:
-            speed = (idx + 1)*images.size(0)*factor / (time.time() - t0)
-            logger.debug(
-                f'[{idx+1}/{len(data_loader_train)}] '
-                f'it/s:{speed:.2f}  '
-                f'loss:{metrics["loss"]:.4f}  '
-                f'acc1:{metrics["acc@1"]:.2f}  acc5:{metrics["acc@5"]:.2f}'
-            )
+        if print_freq and (idx+1) % max(1,len(data_loader_train)//print_freq)==0:
+            speed = (idx+1)*images.size(0)*factor/(time.time()-t0)
+            logger.debug(f'[{idx+1}/{len(data_loader_train)}] '
+                         f'it/s:{speed:.2f}  '
+                         f'loss:{metrics["loss"]:.4f}  '
+                         f'acc1:{metrics["acc@1"]:.2f}  acc5:{metrics["acc@5"]:.2f}')
 
-    # —— 本 epoch 平均 cosine ——
-    mean_da   = sum(all_cos_da)   / len(all_cos_da)   if all_cos_da else 0.0
-    mean_ssdp = sum(all_cos_ssdp) / len(all_cos_ssdp) if all_cos_ssdp else 0.0
-    epoch_cosines_da_ssdp.append(mean_da)
-    epoch_cosines_ssdp.append(mean_ssdp)
-
-    print(
-        f"[Epoch {net.current_epoch:>2d}]  "
-        f"DA-SSDP vs grad: {mean_da:.6f},  SSDP vs grad: {mean_ssdp:.6f}"
-    )
-
-    per_class_acc = (
-        100. * correct / counts.clamp(min=1.0)
-    ) if not warm_phase else torch.zeros(num_cls, device=device)
+    per_class_acc = (100. * correct / counts.clamp(min=1.0)) \
+                    if not warm_phase else torch.zeros(num_cls, device=device)
 
     return metrics['loss'], metrics['acc@1'], metrics['acc@5'], per_class_acc
+
 
 
 
@@ -727,6 +674,62 @@ def cos_annealing_factor(epoch, total_epochs, start_factor, end_factor):
     factor = end_factor + (start_factor - end_factor) * cos_part
     return factor
 
+def visualize_attention_snapshots(
+    model: nn.Module,
+    data_loader: torch.utils.data.DataLoader,
+    device: torch.device,
+    output_dir: str,
+    epochs: list,
+):
+    import matplotlib.pyplot as plt
+    import torch
+    import os
+
+    # 取一个 batch（只用第一个样本）
+    images, _ = next(iter(data_loader))
+    img = images[0:1].to(device)
+
+    for ep in epochs:
+        ckpt_path = os.path.join(output_dir, f'checkpoint_epoch_{ep}.pth')
+        if not os.path.exists(ckpt_path):
+            print(f"Warning: not found {ckpt_path}")
+            continue
+
+        # 加载模型权重
+        ckpt = torch.load(ckpt_path, map_location='cpu')
+        model.load_state_dict(ckpt['model'])
+        model.to(device).eval()
+
+        # 清空旧 attn_maps
+        for m in model.modules():
+            if isinstance(m, DSSAWithSSDP):
+                m.attn_maps = None
+
+        # 前向一次
+        with torch.no_grad():
+            _ = model(img)
+
+        # 找到最后一个 DSSAWithSSDP
+        dssa_block = next(m for m in model.modules() if isinstance(m, DSSAWithSSDP))
+        attn = dssa_block.attn_maps  # [T, 1, heads, N, N]
+        attn = attn.mean(dim=2).squeeze(1)  # [T, N, N]
+
+        # 设置一个更大的 figure
+        fig, axes = plt.subplots(2, 2, figsize=(8, 8))  # 8"x8" 矢量尺寸
+        for t in range(attn.shape[0]):
+            ax = axes[t//2, t%2]
+            im = ax.imshow(attn[t], cmap='hot', interpolation='nearest')
+            ax.set_title(f'Epoch {ep}, t={t+1}')
+            ax.axis('off')
+
+        fig.suptitle(f'Attention Maps at Epoch {ep}')
+        fig.tight_layout(rect=[0, 0, 1, 0.96])
+
+        # 保存为高分辨率 PDF（矢量格式）
+        save_path = os.path.join(output_dir, f'attn_ep{ep}.pdf')
+        fig.savefig(save_path, format='pdf')
+        plt.close(fig)
+        print(f"Saved high-res PDF attention snapshot: {save_path}")
 
 def main():
 
@@ -1017,32 +1020,25 @@ def main():
     logger.info('Training completed.')
 
     ##################################################
-    #           plot & save alignment
+    #      Visualize Attention Snapshots (PDF)
     ##################################################
 
-    plt.figure(figsize=(6, 4))
-    plt.plot(epoch_cosines_da_ssdp, label='DA-SSDP vs grad')
-    plt.plot(epoch_cosines_ssdp,      label='SSDP vs grad')
-    plt.hlines(
-        1.0,
-        0,
-        len(epoch_cosines_da_ssdp) - 1,
-        linestyles='--',
-        label='grad vs itself'
-    )
-    plt.xlabel('Epoch')
-    plt.ylabel('Average cosine similarity')
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(
-        os.path.join(args.output_dir, 'gradient_alignment.pdf'),
-        format='pdf',
-        dpi=600
-    )
-    logger.info("Saved high-res alignment plot to gradient_alignment.pdf")
+    if is_main_process():
+        # 三个阶段：warm-up 末期 / 训练中期 / 训练末期
+        warmup_end = model_without_ddp.ssdp.warmup_epochs - 1
+        mid_epoch  = args.epochs // 2
+        final_ep   = args.epochs - 1
+
+        visualize_attention_snapshots(
+            model_without_ddp,
+            data_loader_test,
+            device=next(model_without_ddp.parameters()).device,
+            output_dir=args.output_dir,
+            epochs=[warmup_end, mid_epoch, final_ep],
+        )
 
     ##################################################
-    #                   Final Test
+    #                   test
     ##################################################
 
     del model, model_without_ddp
@@ -1094,5 +1090,5 @@ def main():
     logger.info('All Done.')
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
