@@ -914,10 +914,9 @@ def main():
     ##################################################
     #                   test only
     ##################################################
-
     if args.test_only:
         if distributed:
-            logger.error('Using distribute mode in test, abort')
+            logger.error('Using distributed mode in test, abort')
             return
         test(
             model_without_ddp,
@@ -929,9 +928,16 @@ def main():
         return
 
     ##################################################
+    #        计算需要额外保存的三个关键 epoch
+    ##################################################
+    # ① warm-up 末期；② 训练中期；③ 训练末期
+    warmup_end = model_without_ddp.ssdp.warmup_epochs - 1
+    mid_epoch = args.epochs // 2
+    final_ep = args.epochs - 1
+
+    ##################################################
     #                     Train
     ##################################################
-
     tb_writer = None
     if is_main_process():
         tb_writer = SummaryWriter(
@@ -943,13 +949,13 @@ def main():
     for epoch in range(start_epoch, args.epochs):
         if distributed and hasattr(data_loader_train.sampler, 'set_epoch'):
             data_loader_train.sampler.set_epoch(epoch)
-        logger.info(
-            f'Epoch [{epoch}] Start, lr {optimizer.param_groups[0]["lr"]:.6f}'
-        )
+        logger.info(f'Epoch [{epoch}] Start, lr {optimizer.param_groups[0]["lr"]:.6f}')
 
+        # 如果模型有 current_epoch，就更新它
         if hasattr(model_without_ddp, 'current_epoch'):
             model_without_ddp.current_epoch = epoch
 
+        # —— 训练一步 ——
         with Timer(' Train', logger):
             train_loss, train_acc1, train_acc5, per_class_acc = train_one_epoch(
                 model,
@@ -968,6 +974,7 @@ def main():
             if scheduler_per_epoch is not None:
                 scheduler_per_epoch.step()
 
+        # —— 验证一步 ——
         with Timer(' Test', logger):
             test_loss, test_acc1, test_acc5 = evaluate(
                 model,
@@ -978,15 +985,12 @@ def main():
                 one_hot
             )
 
+        # —— TensorBoard 记录 ——
         if is_main_process() and tb_writer is not None:
             tb_record(
                 tb_writer,
-                train_loss,
-                train_acc1,
-                train_acc5,
-                test_loss,
-                test_acc1,
-                test_acc5,
+                train_loss, train_acc1, train_acc5,
+                test_loss, test_acc1, test_acc5,
                 epoch
             )
 
@@ -995,6 +999,7 @@ def main():
             f'Acc@1: {test_acc1:.5f}, Acc@5: {test_acc5:.5f}'
         )
 
+        # —— 构造 checkpoint 字典 ——
         checkpoint = {
             'model': model_without_ddp.state_dict(),
             'optimizer': optimizer.state_dict(),
@@ -1004,17 +1009,27 @@ def main():
         if lr_scheduler is not None:
             checkpoint['lr_scheduler'] = lr_scheduler.state_dict()
 
+        # —— 保存 latest 和历史最好 ——
         if args.save_latest:
             save_on_master(
                 checkpoint,
                 os.path.join(args.output_dir, 'checkpoint_latest.pth')
             )
-
         if max_acc1 < test_acc1:
             max_acc1 = test_acc1
             save_on_master(
                 checkpoint,
                 os.path.join(args.output_dir, 'checkpoint_max_acc1.pth')
+            )
+
+        # —— 新增：在三个关键 epoch 保存专属 checkpoint ——
+        if epoch in (warmup_end, mid_epoch, final_ep):
+            save_on_master(
+                checkpoint,
+                os.path.join(
+                    args.output_dir,
+                    f'checkpoint_epoch_{epoch}.pth'
+                )
             )
 
     logger.info('Training completed.')
