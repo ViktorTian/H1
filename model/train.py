@@ -425,57 +425,57 @@ def train_one_epoch(
     scaler: Optional[GradScaler] = None,
     one_hot: Optional[int] = None,
 ):
-    import time, torch
-    import torch.nn.functional as F
-    from collections import defaultdict
-    from spikingjelly.activation_based import functional
+
+    # 全局列表，用于保存每个 epoch 末的 Wproj 权重
+    global epoch_wproj_weights
+    if 'epoch_wproj_weights' not in globals():
+        epoch_wproj_weights = []
 
     model.train()
-
     device  = next(model.parameters()).device
     net     = model.module if hasattr(model, 'module') else model
     num_cls = net.classifier.out_features
-    # net.current_epoch = epoch
-    # -------- 判断阶段 --------
     warm_phase = net.current_epoch < net.ssdp.warmup_epochs
 
-    # -------- 统计 --------
+    # per-class 统计
     counts  = torch.zeros(num_cls, device=device)
     correct = torch.zeros(num_cls, device=device)
 
+    # 简单的 metrics 记录器
     class Record:
         def __init__(self, keys):
             self.sum, self.cnt = defaultdict(float), defaultdict(int)
-            for k in keys: self.sum[k]=0.0; self.cnt[k]=0
-        def update(self,k,v,n=1):
-            self.sum[k]+=v*n; self.cnt[k]+=n
-        def __getitem__(self,k):
-            return self.sum[k]/self.cnt[k] if self.cnt[k] else 0.0
+            for k in keys: self.sum[k] = 0.0; self.cnt[k] = 0
+        def update(self, k, v, n=1):
+            self.sum[k] += v * n; self.cnt[k] += n
+        def __getitem__(self, k):
+            return self.sum[k] / self.cnt[k] if self.cnt[k] else 0.0
+
     metrics = Record(['loss','acc@1','acc@5'])
 
-    def accuracy(out,tgt,topk=(1,5)):
+    def accuracy(out, tgt, topk=(1,5)):
         maxk = max(topk); B = tgt.size(0)
-        _,pred = out.topk(maxk,1,True,True); pred = pred.t()
+        _, pred = out.topk(maxk, 1, True, True); pred = pred.t()
         corr = pred.eq(tgt.view(1,-1).expand_as(pred))
         return [corr[:k].reshape(-1).float().sum().mul_(100.0/B) for k in topk]
 
-    t0 = time.time(); model.zero_grad()
+    t0 = time.time()
+    model.zero_grad()
 
-    for idx,(images,targets_raw) in enumerate(data_loader_train):
-        images       = images.to(device)
-        targets_raw  = targets_raw.to(device)
+    for idx, (images, targets_raw) in enumerate(data_loader_train):
+        images      = images.to(device)
+        targets_raw = targets_raw.to(device)
 
-        # ---------- 统一标签 ----------
-        if targets_raw.ndim > 1:                     # mixup / cutmix -> soft label
+        # -------- 统一标签 --------
+        if targets_raw.ndim > 1:
             targets_idx  = targets_raw.argmax(-1)
             targets_soft = targets_raw.float()
-        else:                                        # 普通整型标签
+        else:
             targets_idx  = targets_raw
             targets_soft = F.one_hot(targets_raw, num_cls).float() if one_hot else None
-
         target_tensor = targets_soft if targets_soft is not None else targets_idx
 
-        # ---------- forward & loss ----------
+        # -------- forward & loss --------
         if scaler:
             with torch.cuda.amp.autocast():
                 outputs = model(images)
@@ -484,7 +484,7 @@ def train_one_epoch(
             outputs = model(images)
             loss    = criterion(outputs, target_tensor)
 
-        # ---------- backward ----------
+        # -------- backward --------
         if scaler:
             scaler.scale(loss).backward()
             scaler.step(optimizer); scaler.update()
@@ -493,71 +493,81 @@ def train_one_epoch(
         model.zero_grad()
         if scheduler_per_iter: scheduler_per_iter.step()
 
-        # ---------- 若网络未写回必需属性，重置继续 ----------
+        # -------- 如果未写回 SSDP 属性，重置并继续 --------
         if not (hasattr(net,'out') and hasattr(net,'t_pre') and hasattr(net,'t_post')):
-            functional.reset_net(model); continue
+            functional.reset_net(model)
+            continue
 
-        # ===========================================================
-        #                 SSDP 更新（仅 ssdp_phase 写权重）
-        # ===========================================================
-        pre  = (net.out   > 0).float()
-        post = (outputs   > 0).float()
+        # -------- SSDP 更新 classifier --------
+        pre  = (net.out > 0).float()
+        post = (outputs > 0).float()
         dt   = (net.t_post.unsqueeze(2) - net.t_pre.unsqueeze(1)).abs()
         delta_w = net.ssdp(pre, post, dt, loss=loss, epoch=net.current_epoch)
         if not warm_phase:
             with torch.no_grad():
                 net.classifier.weight.add_(delta_w.detach())
 
-        # ---- DSSA.Wproj ----
+        # -------- SSDP 更新 DSSA.Wproj --------
         last_stage = net.layers[-1]
         dssa = next((m for m in last_stage if isinstance(m, DSSAWithSSDP)), None)
         if dssa is not None:
-            x_in ,x_out = dssa.x_in.detach(), dssa.x_out.detach()   # [T,B,C,H,W]
+            x_in, x_out = dssa.x_in.detach(), dssa.x_out.detach()
             T,B,C,_,_   = x_in.shape
-            pre_seq  = (x_in .reshape(T,B,C,-1) > 0).any(-1).float()
+            pre_seq  = (x_in.reshape(T,B,C,-1) > 0).any(-1).float()
             post_seq = (x_out.reshape(T,B,C,-1) > 0).any(-1).float()
-
             pre_first  = pre_seq .cumsum(0).argmax(0).float()
             post_first = post_seq.cumsum(0).argmax(0).float()
-            dt2  = (post_first.unsqueeze(2) - pre_first.unsqueeze(1)).abs()
-
-            pre2  = (pre_seq .sum(0) > 0).float()
+            dt2 = (post_first.unsqueeze(2) - pre_first.unsqueeze(1)).abs()
+            pre2  = (pre_seq.sum(0) > 0).float()
             post2 = (post_seq.sum(0) > 0).float()
-
             dw2 = net.ssdp_dssa(pre2, post2, dt2, loss=loss, epoch=net.current_epoch)
             if not warm_phase:
                 with torch.no_grad():
                     dssa.Wproj.weight.add_(dw2.detach().view(C, C, 1, 1))
 
-        # ---------- reset neuron states ----------
+        # -------- reset neuron states --------
         functional.reset_net(model)
 
-        # ---------- 记录 ----------
+        # -------- 记录 loss & acc --------
         metrics.update('loss', loss.item(), images.size(0))
         acc1, acc5 = accuracy(outputs, targets_idx)
         metrics.update('acc@1', acc1.item(), images.size(0))
         metrics.update('acc@5', acc5.item(), images.size(0))
 
-        if not warm_phase:  # 统计 per-class 只在 ssdp_phase
+        # -------- per-class 准确率统计 --------
+        if not warm_phase:
             t_flat = targets_idx.view(-1)
             p_flat = outputs.argmax(1).view(-1)
             counts  += torch.bincount(t_flat, minlength=num_cls).float()
             correct += torch.bincount(
                 t_flat,
                 weights=(p_flat == t_flat).float(),
-                minlength=num_cls).float()
+                minlength=num_cls
+            ).float()
 
-        if print_freq and (idx+1) % max(1,len(data_loader_train)//print_freq)==0:
-            speed = (idx+1)*images.size(0)*factor/(time.time()-t0)
-            logger.debug(f'[{idx+1}/{len(data_loader_train)}] '
-                         f'it/s:{speed:.2f}  '
-                         f'loss:{metrics["loss"]:.4f}  '
-                         f'acc1:{metrics["acc@1"]:.2f}  acc5:{metrics["acc@5"]:.2f}')
+        # -------- 日志输出 --------
+        if print_freq and (idx+1) % max(1, len(data_loader_train)//print_freq) == 0:
+            speed = (idx+1) * images.size(0) * factor / (time.time() - t0)
+            logger.debug(
+                f'[{idx+1}/{len(data_loader_train)}] '
+                f'it/s:{speed:.2f}  '
+                f'loss:{metrics["loss"]:.4f}  '
+                f'acc1:{metrics["acc@1"]:.2f}  acc5:{metrics["acc@5"]:.2f}'
+            )
 
-    per_class_acc = (100. * correct / counts.clamp(min=1.0)) \
-                    if not warm_phase else torch.zeros(num_cls, device=device)
+    # -------- 在每个 epoch 末尾记录 Wproj.weight --------
+    last_stage = net.layers[-1]
+    dssa = next((m for m in last_stage if isinstance(m, DSSAWithSSDP)), None)
+    if dssa is not None:
+        wproj = dssa.Wproj.weight.detach().cpu().squeeze(-1).squeeze(-1)  # [C_out, C_in]
+        epoch_wproj_weights.append(wproj)
+
+    per_class_acc = (
+        100. * correct / counts.clamp(min=1.0)
+    ) if not warm_phase else torch.zeros(num_cls, device=device)
 
     return metrics['loss'], metrics['acc@1'], metrics['acc@5'], per_class_acc
+
 
 
 
@@ -674,7 +684,7 @@ def cos_annealing_factor(epoch, total_epochs, start_factor, end_factor):
     factor = end_factor + (start_factor - end_factor) * cos_part
     return factor
 
-def visualize_attention_snapshots(
+def visualize_attention_and_gain(
     model: nn.Module,
     data_loader: torch.utils.data.DataLoader,
     device: torch.device,
@@ -682,10 +692,10 @@ def visualize_attention_snapshots(
     epochs: list,
 ):
     import matplotlib.pyplot as plt
-    import torch
-    import os
+    import torch, os, numpy as np
 
-    # 取一个 batch（只用第一个样本）
+    # 把三个 epoch 的 attn_maps / v_feats / wproj_dict 都取出来
+    results = {}
     images, _ = next(iter(data_loader))
     img = images[0:1].to(device)
 
@@ -695,41 +705,73 @@ def visualize_attention_snapshots(
             print(f"Warning: not found {ckpt_path}")
             continue
 
-        # 加载模型权重
+        # 加载并前向
         ckpt = torch.load(ckpt_path, map_location='cpu')
         model.load_state_dict(ckpt['model'])
         model.to(device).eval()
-
-        # 清空旧 attn_maps
         for m in model.modules():
             if isinstance(m, DSSAWithSSDP):
                 m.attn_maps = None
+                m.v_feats   = None
 
-        # 前向一次
         with torch.no_grad():
             _ = model(img)
 
-        # 找到最后一个 DSSAWithSSDP
-        dssa_block = next(m for m in model.modules() if isinstance(m, DSSAWithSSDP))
-        attn = dssa_block.attn_maps  # [T, 1, heads, N, N]
-        attn = attn.mean(dim=2).squeeze(1)  # [T, N, N]
+        dssa = next(m for m in model.modules() if isinstance(m, DSSAWithSSDP))
+        # 合并 heads、batch
+        A = dssa.attn_maps.mean(dim=2).squeeze(1)  # [T, N, N]
+        V = dssa.v_feats  .mean(dim=2).squeeze(1)  # [T, dim, N]
+        V = V.transpose(1,2)                       # [T, N, dim]
+        W = dssa.Wproj.weight.detach().cpu().squeeze(-1).squeeze(-1)  # [dim, dim]
 
-        # 设置一个更大的 figure
-        fig, axes = plt.subplots(2, 2, figsize=(8, 8))  # 8"x8" 矢量尺寸
-        for t in range(attn.shape[0]):
+        results[ep] = {'A': A, 'V': V, 'W': W}
+
+        # 原注意力图 (4 帧)
+        fig, axes = plt.subplots(2, 2, figsize=(8,8))
+        for t in range(A.shape[0]):
             ax = axes[t//2, t%2]
-            im = ax.imshow(attn[t], cmap='hot', interpolation='nearest')
+            ax.imshow(A[t], cmap='hot')
             ax.set_title(f'Epoch {ep}, t={t+1}')
             ax.axis('off')
-
         fig.suptitle(f'Attention Maps at Epoch {ep}')
-        fig.tight_layout(rect=[0, 0, 1, 0.96])
-
-        # 保存为高分辨率 PDF（矢量格式）
-        save_path = os.path.join(output_dir, f'attn_ep{ep}.pdf')
-        fig.savefig(save_path, format='pdf')
+        fig.tight_layout(rect=[0,0,1,0.96])
+        fig.savefig(os.path.join(output_dir, f'attn_ep{ep}.pdf'), format='pdf')
         plt.close(fig)
-        print(f"Saved high-res PDF attention snapshot: {save_path}")
+
+    # 用 warmup_end 作为 baseline，final_ep 作为 DA-SSDP
+    ep0, ep1 = epochs[0], epochs[-1]
+    A0, V0, W0 = results[ep0]['A'], results[ep0]['V'], results[ep0]['W']
+    A1, V1, W1 = results[ep1]['A'], results[ep1]['V'], results[ep1]['W']
+
+    # 1) Attention×Value -> M
+    M0 = torch.einsum('tnm,tnd->tmd', A0, V0)  # [T,N,dim]
+    M1 = torch.einsum('tnm,tnd->tmd', A1, V1)
+
+    # 2) Wproj 输出 -> O
+    O0 = torch.einsum('dc,tnd->tnc', W0, M0)   # [T,N,dim]
+    O1 = torch.einsum('dc,tnd->tnc', W1, M1)
+
+    # 3) 差分 & 通道/patch 平均
+    delta = (O1 - O0).abs().mean(dim=0)        # [N,dim]
+    delta_patch = delta.mean(dim=1)           # [N]
+    delta_chan  = delta.mean(dim=0)           # [dim]
+
+    # 4) 绘制 patch 差分热图 (只展示 1 帧平均结果)
+    side = int(np.sqrt(delta_patch.numel()))
+    heat = delta_patch.view(side, side).cpu().numpy()
+    plt.figure(figsize=(4,4))
+    plt.imshow(heat, cmap='jet')
+    plt.title('Δ feature per-patch')
+    plt.colorbar()
+    plt.savefig(os.path.join(output_dir, 'gain_patch.pdf'), format='pdf')
+    plt.close()
+
+    # 5) 绘制 channel 差分条形图
+    plt.figure(figsize=(8,4))
+    plt.bar(np.arange(delta_chan.numel()), delta_chan.cpu().numpy())
+    plt.title('Δ feature per-channel')
+    plt.savefig(os.path.join(output_dir, 'gain_channel.pdf'), format='pdf')
+    plt.close()
 
 def main():
 
@@ -1044,7 +1086,7 @@ def main():
         mid_epoch  = args.epochs // 2
         final_ep   = args.epochs - 1
 
-        visualize_attention_snapshots(
+        visualize_attention_and_gain(
             model_without_ddp,
             data_loader_test,
             device=next(model_without_ddp.parameters()).device,
