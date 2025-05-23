@@ -206,50 +206,58 @@ class DSSA(nn.Module):
         return out
 
 
+# ===== 修改后的 DSSAWithSSDP，用于同时记录 Attention maps 和 Value 特征 =====
+
 class DSSAWithSSDP(DSSA):
     """
-    用于在 forward() 中记录 x_in, x_out 以及每个 time-step 的 attention maps，
+    用于在 forward() 中记录:
+      - x_in, x_out 脉冲序列
+      - 每个 time-step 的 attention maps (self.attn_maps)
+      - 每个 time-step 的 value 特征 (self.v_feats)
     以便训练时做 SSDP 以及后续可视化分析。
     """
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # 记录输入脉冲序列
-        self.x_in = x.detach().clone()  # [T, B, C, H, W]
+        self.x_in = x.detach().clone()           # [T, B, C, H, W]
         T, B, C, H, W = x.shape
 
-        # 1. 激活并做线性变换
+        # 1. 激活+线性变换
         x_feat = x.clone()
-        x_act  = self.activation_in(x_feat)                    # [T, B, C, H, W]
-        y      = self.W(x_act)                                 # [T, B, 2C, H', W']
+        x_act  = self.activation_in(x_feat)      # [T, B, C, H, W]
+        y      = self.W(x_act)                   # [T, B, 2C, H', W']
         y      = self.norm(y)
 
-        # 2. 重塑为多头结构并拆分通道
-        #    新 spatial 大小 H', W'，flatten 得到 N tokens
+        # 2. 重塑为 heads 结构并拆分通道
         _, _, _, H2, W2 = y.shape
         N      = H2 * W2
         dim    = C // self.num_heads
-        # y: [T, B, heads, 2*dim, N]
-        y      = y.reshape(T, B, self.num_heads, 2 * dim, N)
-        # 沿着通道维度拆分为 y1, y2
+        y      = y.reshape(T, B, self.num_heads, 2 * dim, N)  # [T, B, heads, 2dim, N]
         y1, y2 = y.split(dim, dim=3)                           # each [T, B, heads, dim, N]
 
         # 3. 重塑 x 以匹配 matmul1 输入
-        x_flat = x_act.reshape(T, B, self.num_heads, dim, -1)  # [T, B, heads, dim, N]
+        x_flat = x_act.reshape(T, B, self.num_heads, dim, N)   # [T, B, heads, dim, N]
 
-        # 4. 逐时间步计算并记录 attention maps
+        # 4. 逐时间步计算并记录 attention maps & value features
         attn_list = []
+        v_list    = []
         for t in range(T):
             lhs  = y1[t].transpose(-1, -2)   # [B, heads, N, dim]
             rhs  = x_flat[t]                 # [B, heads, dim, N]
             attn = self.matmul1(lhs, rhs)    # [B, heads, N, N]
             attn_list.append(attn.detach().cpu())
-        # 将所有 time-step 堆叠：[T, B, heads, N, N]
-        self.attn_maps = torch.stack(attn_list, dim=0)
+            v_list   .append(rhs .detach().cpu())
 
-        # 5. 原始 DSSA 前向计算
+        # 保存:
+        #  - 注意力 maps:   [T, B, heads, N, N]
+        #  - Value 特征组:  [T, B, heads, dim, N]
+        self.attn_maps = torch.stack(attn_list, dim=0)
+        self.v_feats   = torch.stack(v_list,    dim=0)
+
+        # 5. 执行原始 DSSA 的剩余前向
         out = super().forward(x_feat)
 
         # 6. 记录输出脉冲序列
-        self.x_out = out.detach().clone()  # [T, B, C, H, W]
+        self.x_out = out.detach().clone()       # [T, B, C, H, W]
         return out
 
 
