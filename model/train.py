@@ -739,27 +739,33 @@ def visualize_attention_and_gain(
         plt.close(fig)
 
     # 用 warmup_end 作为 baseline，final_ep 作为 DA-SSDP
+    # ---- 修复 Wproj × Value 维度不匹配问题 ----
+
     ep0, ep1 = epochs[0], epochs[-1]
     A0, V0, W0 = results[ep0]['A'], results[ep0]['V'], results[ep0]['W']
     A1, V1, W1 = results[ep1]['A'], results[ep1]['V'], results[ep1]['W']
 
+    # 合并 heads 维度： [T, heads, dim, N] → [T, N, dim_total]
+    V0 = V0.permute(0, 3, 1, 2).reshape(V0.size(0), V0.size(4), -1)  # [T, N, dim×heads]
+    V1 = V1.permute(0, 3, 1, 2).reshape(V1.size(0), V1.size(4), -1)  # [T, N, dim×heads]
+
     # 1) Attention×Value -> M
-    M0 = torch.einsum('tnm,tnd->tmd', A0, V0)  # [T,N,dim]
-    M1 = torch.einsum('tnm,tnd->tmd', A1, V1)
+    M0 = torch.einsum('tnm,tmd->tnd', A0, V0)
+    M1 = torch.einsum('tnm,tmd->tnd', A1, V1)
 
     # 2) Wproj 输出 -> O
-    O0 = torch.einsum('dc,tnd->tnc', W0, M0)   # [T,N,dim]
-    O1 = torch.einsum('dc,tnd->tnc', W1, M1)
+    O0 = torch.einsum('cd,tnd->tnc', W0, M0)
+    O1 = torch.einsum('cd,tnd->tnc', W1, M1)
 
     # 3) 差分 & 通道/patch 平均
-    delta = (O1 - O0).abs().mean(dim=0)        # [N,dim]
-    delta_patch = delta.mean(dim=1)           # [N]
-    delta_chan  = delta.mean(dim=0)           # [dim]
+    delta = (O1 - O0).abs().mean(dim=0)  # [N,dim]
+    delta_patch = delta.mean(dim=1)  # [N]
+    delta_chan = delta.mean(dim=0)  # [dim]
 
-    # 4) 绘制 patch 差分热图 (只展示 1 帧平均结果)
+    # 4) 绘制 patch 差分热图
     side = int(np.sqrt(delta_patch.numel()))
     heat = delta_patch.view(side, side).cpu().numpy()
-    plt.figure(figsize=(4,4))
+    plt.figure(figsize=(4, 4))
     plt.imshow(heat, cmap='jet')
     plt.title('Δ feature per-patch')
     plt.colorbar()
@@ -767,7 +773,7 @@ def visualize_attention_and_gain(
     plt.close()
 
     # 5) 绘制 channel 差分条形图
-    plt.figure(figsize=(8,4))
+    plt.figure(figsize=(8, 4))
     plt.bar(np.arange(delta_chan.numel()), delta_chan.cpu().numpy())
     plt.title('Δ feature per-channel')
     plt.savefig(os.path.join(output_dir, 'gain_channel.pdf'), format='pdf')
